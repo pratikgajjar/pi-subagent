@@ -106,6 +106,8 @@ export interface WidgetTheme {
 }
 
 export const MAX_ROWS = 6;
+/** Wider rows put the totals too far from the names to read across. */
+const MAX_WIDTH = 120;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ACTIVE: RunState[] = ["starting", "busy"];
 
@@ -146,6 +148,7 @@ function counts(rows: WidgetRow[]): string[] {
  */
 export function renderWidget(rows: WidgetRow[], width: number, theme: WidgetTheme, now = Date.now()): string[] {
 	if (rows.length === 0 || width <= 0) return [];
+	width = Math.min(width, MAX_WIDTH);
 	const outputTokens = rows.reduce((sum, row) => sum + row.activity.outputTokens, 0);
 	const cost = rows.reduce((sum, row) => sum + row.activity.cost, 0);
 	const totals = theme.fg("dim", `↓${formatCount(outputTokens)} $${cost.toFixed(2)}`);
