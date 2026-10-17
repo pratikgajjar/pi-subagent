@@ -2,7 +2,7 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in tmux with a dedicated Pi JSONL session. When the parent runs inside tmux, the child opens as a detached window in the parent's tmux session, named after the child and marked with the window option `@pi-subagent=<handle>`. Outside tmux, each child gets its own `pi-subagent-<handle>` session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
 

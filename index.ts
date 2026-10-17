@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,14 +7,16 @@ import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendi
 import {
 	effectiveRunState,
 	inboxDir,
+	killRun,
 	launchRun,
 	listRuns,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
+	runIsLive,
+	runTarget,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
@@ -91,10 +93,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!selected || !tui) return;
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
+			const target = runTarget(run);
+			if (!target) {
+				ctx.ui.notify(`${run.handle} is not running`, "error");
+				return;
+			}
 
 			if (process.env.TMUX) {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
+					// Switch the client to the session, then select the child's window in it.
+					const child = spawn("tmux", ["switch-client", "-t", target, ";", "select-window", "-t", target], {
+						stdio: "inherit",
+					});
 					child.on("error", () => resolveExit(null));
 					child.on("close", resolveExit);
 				});
@@ -105,7 +115,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			tui.stop();
 			try {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["attach-session", "-t", run.tmuxSession], { stdio: "inherit" });
+					const child = spawn("tmux", ["select-window", "-t", target, ";", "attach-session", "-t", target], {
+						stdio: "inherit",
+					});
 					child.on("error", () => resolveExit(null));
 					child.on("close", resolveExit);
 				});
@@ -149,7 +161,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
+				if (!run.suspended || runIsLive(run)) continue;
 				if (!existsSync(run.sessionFile)) {
 					removeRunDir(run.runDir);
 					continue;
@@ -180,12 +192,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
+				if (!runIsLive(run)) {
 					if (!run.suspended) removeRunDir(run.runDir);
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+				killRun(run);
 				await waitForRunShutdown(run.runDir);
 			}
 		});

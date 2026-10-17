@@ -22,7 +22,10 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
+	/** The child's own tmux session, or in window mode the session that hosts its window. */
 	tmuxSession: string;
+	/** "window": the child runs in a window of the parent's tmux session, marked with `@pi-subagent`. */
+	tmuxMode?: "window";
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -155,8 +158,79 @@ export function tmuxSessionExists(session: string): boolean {
 	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+/** Window option that marks a child's window with its handle. */
+export const WINDOW_MARK = "@pi-subagent";
+
+function tmuxOutput(args: string[]): string | undefined {
+	const result = spawnSync("tmux", args, { encoding: "utf8" });
+	return result.status === 0 ? result.stdout.trim() : undefined;
+}
+
+/** The tmux session of the calling pane, when the caller runs inside tmux. */
+function hostSession(): { id: string; name: string } | undefined {
+	const pane = process.env.TMUX_PANE;
+	if (!process.env.TMUX || !pane) return undefined;
+	const [id, name] = (tmuxOutput(["display-message", "-p", "-t", pane, "#{session_id}\t#{session_name}"]) ?? "").split("\t");
+	return id && name ? { id, name } : undefined;
+}
+
+/** The child's name as a tmux window name: `:` and `.` separate tmux targets, so they become `-`. */
+export function windowName(metadata: RunMetadata): string {
+	const name = (metadata.name ?? "").replace(/[\s:.]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+	return name || `sub-${metadata.handle}`;
+}
+
+/**
+ * The window id of a window-mode run. Found by its mark, not a stored id: tmux reuses
+ * window ids after a server restart, and a stale id could name one of the user's windows.
+ */
+export function runWindow(metadata: RunMetadata): string | undefined {
+	if (metadata.tmuxMode !== "window") return undefined;
+	const windows = tmuxOutput(["list-windows", "-a", "-F", `#{window_id}\t#{${WINDOW_MARK}}`]) ?? "";
+	for (const line of windows.split("\n")) {
+		const [id, handle] = line.split("\t");
+		if (id && handle === metadata.handle) return id;
+	}
+	return undefined;
+}
+
+export function runIsLive(metadata: RunMetadata): boolean {
+	return metadata.tmuxMode === "window" ? runWindow(metadata) !== undefined : tmuxSessionExists(metadata.tmuxSession);
+}
+
+/** The tmux target that shows the child: its window id or its own session. */
+export function runTarget(metadata: RunMetadata): string | undefined {
+	return metadata.tmuxMode === "window" ? runWindow(metadata) : metadata.tmuxSession;
+}
+
+/** Close the child's window or session. Never touches a window without the run's mark. */
+export function killRun(metadata: RunMetadata): void {
+	if (metadata.tmuxMode !== "window") {
+		spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
+		return;
+	}
+	const window = runWindow(metadata);
+	if (window) spawnSync("tmux", ["kill-window", "-t", window], { stdio: "ignore" });
+}
+
+export function renameRunWindow(metadata: RunMetadata): void {
+	const window = runWindow(metadata);
+	if (window) spawnSync("tmux", ["rename-window", "-t", window, windowName(metadata)], { stdio: "ignore" });
+}
+
+/** One line that tells the user where the child runs. */
+export function runLocation(metadata: RunMetadata): string {
+	return metadata.tmuxMode === "window"
+		? `Window: ${metadata.tmuxSession}:${windowName(metadata)}`
+		: `Attach: tmux attach -t ${metadata.tmuxSession}`;
+}
+
+/**
+ * Start the child pi process for a run. Inside tmux it opens a detached window in the
+ * caller's session; outside tmux it opens its own session. The placement is written to
+ * the metadata before the child starts. `initialArgs` are only passed on first spawn.
+ */
+export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): RunMetadata {
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -166,43 +240,62 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
+	const command = [
+		"env",
+		`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+		launcher,
+		"--session",
+		metadata.sessionFile,
+		"--provider",
+		metadata.provider,
+		"--model",
+		metadata.model,
+		"--thinking",
+		metadata.thinking,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	];
+
+	const host = hostSession();
+	if (host) {
+		const placed = updateMetadata(metadata.runDir, { tmuxMode: "window", tmuxSession: host.name }) ?? {
+			...metadata,
+			tmuxMode: "window",
+			tmuxSession: host.name,
+		};
+		const result = spawnSync(
+			"tmux",
+			["new-window", "-d", "-P", "-F", "#{window_id}", "-t", `${host.id}:`, "-n", windowName(placed), "-c", placed.cwd, "--", ...command],
+			{ encoding: "utf8" },
+		);
+		const window = result.stdout?.trim();
+		if (result.status !== 0 || !window) throw new Error(result.stderr.trim() || "Failed to create tmux window");
+		if (spawnSync("tmux", ["set-option", "-w", "-t", window, WINDOW_MARK, placed.handle], { stdio: "ignore" }).status !== 0) {
+			spawnSync("tmux", ["kill-window", "-t", window], { stdio: "ignore" });
+			throw new Error("Failed to mark the subagent window");
+		}
+		return placed;
+	}
+
+	const tmuxSession = `pi-subagent-${metadata.handle}`;
+	const placed = updateMetadata(metadata.runDir, { tmuxMode: undefined, tmuxSession }) ?? {
+		...metadata,
+		tmuxMode: undefined,
+		tmuxSession,
+	};
 	const result = spawnSync(
 		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
+		["new-session", "-d", "-s", tmuxSession, "-x", "120", "-y", "40", "-c", placed.cwd, "--", ...command],
 		{ encoding: "utf8" },
 	);
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	return placed;
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!runIsLive(metadata)
 	) {
 		return "exited";
 	}
