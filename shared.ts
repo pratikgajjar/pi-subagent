@@ -37,6 +37,10 @@ export interface RunMetadata {
 	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
 	suspended?: boolean;
 	state: RunState;
+	/** When `state` last changed; `updateMetadata` keeps it current. */
+	stateSince?: string;
+	/** One line that says what the child was asked to do. */
+	task?: string;
 	hasStarted: boolean;
 	createdAt: string;
 	updatedAt: string;
@@ -129,14 +133,16 @@ export function writeMetadata(metadata: RunMetadata): void {
 export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): RunMetadata | undefined {
 	const current = readMetadata(runDir);
 	if (!current) return undefined;
+	const now = new Date().toISOString();
 	const next: RunMetadata = {
 		...current,
 		...patch,
 		version: 1,
 		handle: current.handle,
 		runDir: current.runDir,
-		updatedAt: new Date().toISOString(),
+		updatedAt: now,
 	};
+	if (patch.state && patch.state !== current.state) next.stateSince = now;
 	writeMetadata(next);
 	return next;
 }
@@ -196,6 +202,15 @@ export function runWindow(metadata: RunMetadata): string | undefined {
 
 export function runIsLive(metadata: RunMetadata): boolean {
 	return metadata.tmuxMode === "window" ? runWindow(metadata) !== undefined : tmuxSessionExists(metadata.tmuxSession);
+}
+
+/** A liveness check for many runs from two tmux listings, for callers that poll every run. */
+export function liveRunChecker(): (metadata: RunMetadata) => boolean {
+	const lines = (args: string[]) => new Set((tmuxOutput(args) ?? "").split("\n").filter(Boolean));
+	const marked = lines(["list-windows", "-a", "-F", `#{${WINDOW_MARK}}`]);
+	const sessions = lines(["list-sessions", "-F", "#{session_name}"]);
+	return (metadata) =>
+		metadata.tmuxMode === "window" ? marked.has(metadata.handle) : sessions.has(metadata.tmuxSession);
 }
 
 /** The tmux target that shows the child: its window id or its own session. */
@@ -292,10 +307,13 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): Ru
 	return placed;
 }
 
-export function effectiveRunState(metadata: RunMetadata): RunState {
+export function effectiveRunState(
+	metadata: RunMetadata,
+	isLive: (metadata: RunMetadata) => boolean = runIsLive,
+): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!runIsLive(metadata)
+		!isLive(metadata)
 	) {
 		return "exited";
 	}

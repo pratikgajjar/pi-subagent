@@ -10,6 +10,7 @@ import {
 	killRun,
 	launchRun,
 	listRuns,
+	liveRunChecker,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
@@ -20,6 +21,7 @@ import {
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
+import { ActivityTracker, renderWidget, type WidgetRow } from "./widget.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -132,28 +134,49 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	if (!runDir) {
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
+		let widgetShown = false;
+		let rows: WidgetRow[] = [];
+		let requestRender: (() => void) | undefined;
+		const tracker = new ActivityTracker();
 
+		// Re-read the runs once a second. The widget component renders the latest rows and
+		// animates the spinner on its own timer while a child is working.
 		const refreshWidget = (): void => {
-			if (!widgetContext) return;
-			const activeRuns = listRuns(widgetContext.sessionManager.getSessionId())
-				.map((run) => ({ run, state: effectiveRunState(run) }))
-				.filter(({ state }) => state !== "exited");
-			if (activeRuns.length === 0) {
-				widgetContext.ui.setWidget("subagents", undefined);
+			const ctx = widgetContext;
+			if (!ctx) return;
+			const isLive = liveRunChecker();
+			rows = listRuns(ctx.sessionManager.getSessionId())
+				.map((run) => ({ run, state: effectiveRunState(run, isLive) }))
+				.filter(({ state }) => state !== "exited")
+				.map(({ run, state }) => ({ run, state, activity: tracker.read(run) }));
+			tracker.forget(new Set(rows.map((row) => row.run.handle)));
+			if (rows.length === 0) {
+				if (widgetShown) ctx.ui.setWidget("subagents", undefined);
+				widgetShown = false;
 				return;
 			}
-
-			const visible = activeRuns.slice(0, 5).map(({ run, state }) => {
-				const color =
-					state === "busy" ? "warning" : state === "idle" ? "success" : state === "error" ? "error" : "muted";
-				return widgetContext!.ui.theme.fg(color, `${run.name ?? run.handle}:${state}`);
-			});
-			if (activeRuns.length > visible.length) {
-				visible.push(widgetContext.ui.theme.fg("muted", `+${activeRuns.length - visible.length}`));
+			if (widgetShown) {
+				requestRender?.();
+				return;
 			}
-			widgetContext.ui.setWidget(
+			widgetShown = true;
+			ctx.ui.setWidget(
 				"subagents",
-				[widgetContext.ui.theme.fg("dim", "subagents: ") + visible.join(widgetContext.ui.theme.fg("dim", " | "))],
+				(tui, theme) => {
+					requestRender = () => tui.requestRender();
+					const spinner = setInterval(() => {
+						if (rows.some((row) => row.state === "busy" || row.state === "starting")) tui.requestRender();
+					}, 200);
+					spinner.unref();
+					return {
+						render: (width: number) => renderWidget(rows, width, theme),
+						invalidate: () => {},
+						dispose: () => {
+							clearInterval(spinner);
+							requestRender = undefined;
+						},
+					};
+				},
 				{ placement: "belowEditor" },
 			);
 		};
@@ -187,6 +210,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
 			widgetContext = undefined;
+			widgetShown = false;
 			ctx.ui.setWidget("subagents", undefined);
 			if (event.reason === "reload") return;
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this

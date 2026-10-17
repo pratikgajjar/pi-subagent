@@ -2,7 +2,7 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	assistantText,
@@ -187,6 +187,8 @@ function spawnSubagent(args: string[]): void {
 		thinking,
 		launchArgs,
 		state: "starting",
+		stateSince: now,
+		task: (prompts[0] ?? files.map((file) => basename(file)).join(", ")).trim().split("\n")[0].slice(0, 160),
 		hasStarted: false,
 		createdAt: now,
 		updatedAt: now,
