@@ -1,27 +1,9 @@
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
-import {
-	effectiveRunState,
-	inboxDir,
-	killRun,
-	launchRun,
-	listRuns,
-	liveRunChecker,
-	readMetadata,
-	removeRunDir,
-	runDisplayName,
-	runIsLive,
-	runTarget,
-	type InboxMessage,
-	type RunMetadata,
-	updateMetadata,
-	waitForRunShutdown,
-} from "./shared.ts";
-import { ActivityTracker, renderWidget, type WidgetRow } from "./widget.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { openPicker, registerParent } from "./parent.ts";
+import { inboxDir, type InboxMessage, readMetadata, updateMetadata } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -29,10 +11,6 @@ function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const message = value as Record<string, unknown>;
 	return typeof message.message === "string" && (message.delivery === "auto" || message.delivery === "followUp");
-}
-
-function displayState(metadata: RunMetadata): string {
-	return effectiveRunState(metadata).padEnd(8);
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
@@ -43,188 +21,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("subagent", {
 		description: "Select and attach to a subagent spawned by this session",
-		handler: async (_args, ctx) => {
-			const runs = listRuns(ctx.sessionManager.getSessionId()).filter((run) => effectiveRunState(run) !== "exited");
-			if (runs.length === 0) {
-				ctx.ui.notify("No active subagents spawned by this session", "info");
-				return;
-			}
-
-			const items: SelectItem[] = runs.map((run) => ({
-				value: run.handle,
-				label: `${runDisplayName(run)}  ${displayState(run)}  ${run.provider}/${run.model}  ${run.thinking}`,
-			}));
-			let tui: TUI | undefined;
-			const selected = await ctx.ui.custom<string | undefined>((customTui, theme, _keybindings, done) => {
-				tui = customTui;
-				const list = new SelectList(items, Math.min(items.length, 10), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-				list.onSelect = (item) => done(item.value);
-				list.onCancel = () => done(undefined);
-
-				const container = new Container();
-				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Attach to subagent")), 1, 0));
-				container.addChild(list);
-				container.addChild(
-					new Text(
-						theme.fg(
-							"dim",
-							`${keyHint("tui.select.confirm", "attach")}  ${keyHint("tui.select.cancel", "cancel")}`,
-						),
-						1,
-						0,
-					),
-				);
-				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-
-				return {
-					render: (width) => container.render(width),
-					invalidate: () => container.invalidate(),
-					handleInput: (data) => {
-						list.handleInput(data);
-						customTui.requestRender();
-					},
-				};
-			});
-			if (!selected || !tui) return;
-			const run = runs.find((candidate) => candidate.handle === selected);
-			if (!run) return;
-			const target = runTarget(run);
-			if (!target) {
-				ctx.ui.notify(`${run.handle} is not running`, "error");
-				return;
-			}
-
-			if (process.env.TMUX) {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					// Switch the client to the session, then select the child's window in it.
-					const child = spawn("tmux", ["switch-client", "-t", target, ";", "select-window", "-t", target], {
-						stdio: "inherit",
-					});
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) ctx.ui.notify(`Could not switch to ${run.handle}`, "error");
-				return;
-			}
-
-			tui.stop();
-			try {
-				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["select-window", "-t", target, ";", "attach-session", "-t", target], {
-						stdio: "inherit",
-					});
-					child.on("error", () => resolveExit(null));
-					child.on("close", resolveExit);
-				});
-				if (exitCode !== 0) process.stderr.write(`Could not attach to ${run.handle}\n`);
-			} finally {
-				tui.start();
-				tui.requestRender(true);
-			}
-		},
+		handler: async (_args, ctx) => openPicker(ctx),
 	});
 
 	if (!runDir) {
-		let widgetTimer: ReturnType<typeof setInterval> | undefined;
-		let widgetContext: ExtensionContext | undefined;
-		let widgetShown = false;
-		let rows: WidgetRow[] = [];
-		let requestRender: (() => void) | undefined;
-		const tracker = new ActivityTracker();
-
-		// Re-read the runs once a second. The widget component renders the latest rows and
-		// animates the spinner on its own timer while a child is working.
-		const refreshWidget = (): void => {
-			const ctx = widgetContext;
-			if (!ctx) return;
-			const isLive = liveRunChecker();
-			rows = listRuns(ctx.sessionManager.getSessionId())
-				.map((run) => ({ run, state: effectiveRunState(run, isLive) }))
-				.filter(({ state }) => state !== "exited")
-				.map(({ run, state }) => ({ run, state, activity: tracker.read(run) }));
-			tracker.forget(new Set(rows.map((row) => row.run.handle)));
-			if (rows.length === 0) {
-				if (widgetShown) ctx.ui.setWidget("subagents", undefined);
-				widgetShown = false;
-				return;
-			}
-			if (widgetShown) {
-				requestRender?.();
-				return;
-			}
-			widgetShown = true;
-			ctx.ui.setWidget(
-				"subagents",
-				(tui, theme) => {
-					requestRender = () => tui.requestRender();
-					const spinner = setInterval(() => {
-						if (rows.some((row) => row.state === "busy" || row.state === "starting")) tui.requestRender();
-					}, 200);
-					spinner.unref();
-					return {
-						render: (width: number) => renderWidget(rows, width, theme),
-						invalidate: () => {},
-						dispose: () => {
-							clearInterval(spinner);
-							requestRender = undefined;
-						},
-					};
-				},
-				{ placement: "belowEditor" },
-			);
-		};
-
-		pi.on("session_start", (_event, ctx) => {
-			// Relaunch children that were suspended when this session was last quit or switched away from.
-			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || runIsLive(run)) continue;
-				if (!existsSync(run.sessionFile)) {
-					removeRunDir(run.runDir);
-					continue;
-				}
-				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
-				try {
-					launchRun(starting);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					updateMetadata(run.runDir, { state: "error", error: message });
-					if (ctx.hasUI) ctx.ui.notify(`Could not resume subagent ${runDisplayName(run)}: ${message}`, "error");
-				}
-			}
-
-			if (!ctx.hasUI) return;
-			widgetContext = ctx;
-			refreshWidget();
-			widgetTimer = setInterval(refreshWidget, 1000);
-			widgetTimer.unref();
-		});
-
-		pi.on("session_shutdown", async (event, ctx) => {
-			if (widgetTimer) clearInterval(widgetTimer);
-			widgetTimer = undefined;
-			widgetContext = undefined;
-			widgetShown = false;
-			ctx.ui.setWidget("subagents", undefined);
-			if (event.reason === "reload") return;
-			// Suspend running children: stop the process but keep transcript and metadata so resuming this
-			// session relaunches them. Children that already exited on their own are discarded.
-			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!runIsLive(run)) {
-					if (!run.suspended) removeRunDir(run.runDir);
-					continue;
-				}
-				updateMetadata(run.runDir, { suspended: true });
-				killRun(run);
-				await waitForRunShutdown(run.runDir);
-			}
-		});
+		registerParent(pi);
 		return;
 	}
 

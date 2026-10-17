@@ -281,6 +281,8 @@ async function waitSubagent(args: string[]): Promise<void> {
 			const message = readLatestAssistant(metadata.sessionFile);
 			if (!message) fail(`${handle} finished without an assistant response`);
 			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
+			// The parent extension skips its completion message for a result printed here.
+			updateMetadata(metadata.runDir, { reportedAt: new Date().toISOString() });
 			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
 			return;
 		}

@@ -41,6 +41,8 @@ export interface RunMetadata {
 	stateSince?: string;
 	/** One line that says what the child was asked to do. */
 	task?: string;
+	/** When the parent last received the child's result, from `subagent wait` or a completion message. */
+	reportedAt?: string;
 	hasStarted: boolean;
 	createdAt: string;
 	updatedAt: string;

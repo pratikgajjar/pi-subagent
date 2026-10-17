@@ -68,7 +68,9 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent`, or Left on an empty prompt, to select and attach to an active child. The widget below the editor shows a summary line and, while any child works, one row per child: state, time in that state, its last tool call or reply, output tokens and cost.
+
+When a child finishes, fails, or exits, the parent receives a `subagent-result` message with the reply and starts a turn if it is idle, so a parent does not need to block on `wait`. Children that finish together arrive in one message; a result that `wait` already printed is not sent again.
 
 ## Isolation
 

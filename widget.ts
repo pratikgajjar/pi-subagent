@@ -157,7 +157,7 @@ export function renderWidget(rows: WidgetRow[], width: number, theme: WidgetThem
 		theme.fg("accent", "subagents") +
 		theme.fg("dim", " · ") +
 		counts(rows).join(theme.fg("dim", " · ")) +
-		(active ? "" : theme.fg("dim", " · /subagent to attach"));
+		(active ? "" : theme.fg("dim", " · ← or /subagent to attach"));
 	const lines = [fit(header, totals, width)];
 	if (!active) return lines;
 
@@ -195,9 +195,9 @@ export function renderWidget(rows: WidgetRow[], width: number, theme: WidgetThem
 
 	const hidden = ordered.slice(shown.length);
 	if (hidden.length > 0) {
-		lines.push(theme.fg("dim", truncateToWidth(` +${hidden.length} more: ${counts(hidden).join(", ")} · /subagent to attach`, width)));
+		lines.push(theme.fg("dim", truncateToWidth(` +${hidden.length} more: ${counts(hidden).join(", ")} · ← or /subagent to attach`, width)));
 	} else {
-		lines.push(theme.fg("dim", " /subagent to attach"));
+		lines.push(theme.fg("dim", " ← or /subagent to attach"));
 	}
 	return lines;
 }

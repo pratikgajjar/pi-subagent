@@ -55,6 +55,10 @@ Three additional built-in tools are available but off by default:
 
 Spawn prints a random handle and where the child runs (`Window: <session>:<name>`, or a tmux attach command). Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
 
+## Completion messages
+
+When a child finishes, fails, or exits, this session receives a `subagent-result` message with the child's reply (up to 1,500 characters) and starts a turn if it is idle. Children that finish together arrive in one message. So after spawning independent children, end your turn when you have nothing else to do; do not block on `wait` or poll `status`. A result that `wait` already printed is not sent again.
+
 ## Inspect and wait
 
 ```sh
@@ -65,7 +69,7 @@ subagent wait <handle>
 
 Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
 
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+Use `wait` when you need a child's answer within the current turn, or the full reply after a truncated completion message. `wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
 
 ## Communicate
 
@@ -90,4 +94,4 @@ subagent stop <handle>
 
 Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes the child's tmux window or session and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Inside tmux, selecting one switches the current tmux client to the child's window. Outside tmux it suspends the current Pi TUI and attaches to the child's session; detaching returns to the parent Pi.
+The interactive `/subagent` command, or Left on an empty prompt, lists active subagents spawned by the current Pi session with their state, window, model, and task. Inside tmux, selecting one switches the current tmux client to the child's window. Outside tmux it suspends the current Pi TUI and attaches to the child's session; detaching returns to the parent Pi.
