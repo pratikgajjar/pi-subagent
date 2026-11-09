@@ -92,6 +92,6 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes the child's tmux window or session and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes the child's tmux window or session, saves its transcript in Pi's normal session store, and removes the run metadata. The command prints the transcript path; resume it with `pi --session <path>`. If archiving fails, the run directory stays intact and the command reports an error. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
 The interactive `/subagent` command, or Left on an empty prompt, lists active subagents spawned by the current Pi session with their state, window, model, and task. Inside tmux, selecting one switches the current tmux client to the child's window. Outside tmux it suspends the current Pi TUI and attaches to the child's session; detaching returns to the parent Pi.

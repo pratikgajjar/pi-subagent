@@ -243,12 +243,22 @@ export function registerParent(pi: ExtensionAPI): void {
 		if (ctx.hasUI) showWidget(ctx);
 	};
 
+	const cleanup = (run: RunMetadata, ctx: ExtensionContext): void => {
+		try {
+			removeRunDir(run.runDir);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (ctx.hasUI) ctx.ui.notify(message, "error");
+			else process.stderr.write(`${message}\n`);
+		}
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		// Relaunch children that were suspended when this session was last quit or switched away from.
 		for (const run of listRuns(ctx.sessionManager.getSessionId())) {
 			if (!run.suspended || runIsLive(run)) continue;
 			if (!existsSync(run.sessionFile)) {
-				removeRunDir(run.runDir);
+				cleanup(run, ctx);
 				continue;
 			}
 			const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
@@ -293,10 +303,10 @@ export function registerParent(pi: ExtensionAPI): void {
 		ctx.ui.setWidget("subagents", undefined);
 		if (event.reason === "reload") return;
 		// Suspend running children: stop the process but keep transcript and metadata so resuming this
-		// session relaunches them. Children that already exited on their own are discarded.
+		// session relaunches them. Archive transcripts of children that already exited on their own.
 		for (const run of listRuns(ctx.sessionManager.getSessionId())) {
 			if (!runIsLive(run)) {
-				if (!run.suspended) removeRunDir(run.runDir);
+				if (!run.suspended) cleanup(run, ctx);
 				continue;
 			}
 			updateMetadata(run.runDir, { suspended: true });

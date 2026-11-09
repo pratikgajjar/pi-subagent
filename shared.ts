@@ -2,16 +2,18 @@ import { spawnSync } from "node:child_process";
 import {
 	accessSync,
 	constants,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
@@ -158,8 +160,47 @@ export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Prom
 	}
 }
 
-export function removeRunDir(runDir: string): void {
+/** Archive before every cleanup, including failed launches and children that exited on their own. */
+export function removeRunDir(runDir: string): string | undefined {
+	const sessionFile = join(runDir, "session.jsonl");
+	let archived: string | undefined;
+	try {
+		let content: string;
+		try {
+			content = readFileSync(sessionFile, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			content = "";
+		}
+		// Spawn creates an empty file before Pi starts. There is no transcript to keep yet.
+		if (content.length > 0) {
+			const header = JSON.parse(content.split("\n", 1)[0]);
+			if (
+				header?.type !== "session" ||
+				typeof header.id !== "string" ||
+				!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(header.id) ||
+				typeof header.cwd !== "string" || !isAbsolute(header.cwd) ||
+				typeof header.timestamp !== "string" ||
+				new Date(header.timestamp).toISOString() !== header.timestamp
+			) {
+				throw new Error("Invalid session header");
+			}
+			// Match Pi core/session-manager: getDefaultSessionDirPath and newSession.
+			// The session header already contains Pi's resolved, absolute cwd.
+			const slug = `--${resolve(header.cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+			const sessionDir = join(getAgentDir(), "sessions", slug);
+			const timestamp = header.timestamp.replace(/[:.]/g, "-");
+			archived = join(sessionDir, `${timestamp}_${header.id}.jsonl`);
+			mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+			// Copy then unlink also works across filesystems. EXCL never replaces an existing session.
+			copyFileSync(sessionFile, archived, constants.COPYFILE_EXCL);
+			unlinkSync(sessionFile);
+		}
+	} catch (error) {
+		throw new Error(`Could not archive transcript; kept run directory ${runDir}: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+	return archived;
 }
 
 export function tmuxSessionExists(session: string): boolean {

@@ -297,8 +297,9 @@ async function stopSubagent(args: string[]): Promise<void> {
 	const wasRunning = runIsLive(metadata);
 	killRun(metadata);
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
-	removeRunDir(metadata.runDir);
+	const archived = removeRunDir(metadata.runDir);
 	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	if (archived) process.stdout.write(`Transcript: ${archived}\n`);
 }
 
 function listSubagents(args: string[]): void {
