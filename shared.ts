@@ -24,6 +24,10 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
+	/** PID published by the child; turn-end events are not process exits. */
+	pid?: number;
+	/** Transcript leaf before the logical turn, including automatic continuations. */
+	turnStartId?: string | null;
 	/** The child's own tmux session, or in window mode the session that hosts its window. */
 	tmuxSession: string;
 	/** "window": the child runs in a window of the parent's tmux session, marked with `@pi-subagent`. */
@@ -61,6 +65,9 @@ interface SessionEntry {
 	id: string;
 	parentId: string | null;
 	message?: unknown;
+	customType?: string;
+	data?: unknown;
+	name?: string;
 }
 
 interface AssistantMessage {
@@ -243,17 +250,34 @@ export function runWindow(metadata: RunMetadata): string | undefined {
 	return undefined;
 }
 
-export function runIsLive(metadata: RunMetadata): boolean {
-	return metadata.tmuxMode === "window" ? runWindow(metadata) !== undefined : tmuxSessionExists(metadata.tmuxSession);
+function pidIsLive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// Permission errors do not prove that a process exited.
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
 }
 
-/** A liveness check for many runs from two tmux listings, for callers that poll every run. */
+export function runIsLive(metadata: RunMetadata): boolean {
+	return metadata.pid ? pidIsLive(metadata.pid) : liveRunChecker()(metadata);
+}
+
+/** Check PIDs, with one pane listing for older children that did not publish a PID. */
 export function liveRunChecker(): (metadata: RunMetadata) => boolean {
-	const lines = (args: string[]) => new Set((tmuxOutput(args) ?? "").split("\n").filter(Boolean));
-	const marked = lines(["list-windows", "-a", "-F", `#{${WINDOW_MARK}}`]);
-	const sessions = lines(["list-sessions", "-F", "#{session_name}"]);
-	return (metadata) =>
-		metadata.tmuxMode === "window" ? marked.has(metadata.handle) : sessions.has(metadata.tmuxSession);
+	const panes = tmuxOutput(["list-panes", "-a", "-F", `#{session_name}\t#{${WINDOW_MARK}}\t#{pane_dead}`]);
+	const marked = new Set<string>();
+	const sessions = new Set<string>();
+	for (const line of (panes ?? "").split("\n")) {
+		const [session, handle, dead] = line.split("\t");
+		if (dead !== "0") continue;
+		sessions.add(session);
+		if (handle) marked.add(handle);
+	}
+	return (metadata) => metadata.pid ? pidIsLive(metadata.pid)
+		// A failed tmux query alone is not proof of an exit.
+		: panes === undefined || (metadata.tmuxMode === "window" ? marked.has(metadata.handle) : sessions.has(metadata.tmuxSession));
 }
 
 /** The tmux target that shows the child: its window id or its own session. */
@@ -289,6 +313,8 @@ export function runLocation(metadata: RunMetadata): string {
  * the metadata before the child starts. `initialArgs` are only passed on first spawn.
  */
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): RunMetadata {
+	// A resumed child must not inherit the old process identity.
+	metadata = updateMetadata(metadata.runDir, { pid: undefined }) ?? metadata;
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -354,13 +380,20 @@ export function effectiveRunState(
 	metadata: RunMetadata,
 	isLive: (metadata: RunMetadata) => boolean = runIsLive,
 ): RunState {
-	if (
-		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!isLive(metadata)
-	) {
-		return "exited";
-	}
+	if (metadata.state === "error") return "error";
+	if (!isLive(metadata)) return "exited";
+	// Never trust a lifecycle notification over the actual process/pane.
+	if (metadata.state === "exited") return "busy";
+	if (metadata.state === "idle" && hasInboxMessages(metadata.runDir)) return "busy";
 	return metadata.state;
+}
+
+export function hasInboxMessages(runDir: string): boolean {
+	try {
+		return readdirSync(inboxDir(runDir)).some((file) => file.endsWith(".json"));
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
 }
 
 export function listRuns(parentSessionId?: string): RunMetadata[] {
@@ -405,12 +438,12 @@ function isAssistantEntry(entry: SessionEntry): entry is AssistantEntry {
 	return (entry.message as Record<string, unknown>).role === "assistant";
 }
 
-export function readLatestAssistant(sessionFile: string): AssistantMessage | undefined {
+function readBranch(sessionFile: string): SessionEntry[] {
 	let content: string;
 	try {
 		content = readFileSync(sessionFile, "utf8");
 	} catch {
-		return undefined;
+		return [];
 	}
 	const entries: SessionEntry[] = [];
 	for (const line of content.split("\n")) {
@@ -422,16 +455,78 @@ export function readLatestAssistant(sessionFile: string): AssistantMessage | und
 			// The final JSONL record may still be in the process of being appended.
 		}
 	}
-	return activeBranch(entries).findLast(isAssistantEntry)?.message;
+	return activeBranch(entries);
 }
 
-export function assistantText(message: AssistantMessage): string {
-	if (!Array.isArray(message.content)) return message.errorMessage ?? "(no response text)";
+export function readLatestAssistant(sessionFile: string): AssistantMessage | undefined {
+	return readBranch(sessionFile).findLast(isAssistantEntry)?.message;
+}
+
+function record(value: unknown): Record<string, unknown> {
+	return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+}
+
+/** Read only this logical turn on the active branch, never an earlier result. */
+export function readTurnResult(run: RunMetadata, parentName?: string): { message?: AssistantMessage; reportedOverIntercomAt?: string } {
+	const branch = readBranch(run.sessionFile);
+	const start = run.turnStartId === undefined
+		// Older children have no saved boundary. Treat injected messages as new input too.
+		? branch.findLastIndex((entry) => entry.type === "custom_message" || (entry.type === "message" && record(entry.message).role === "user"))
+		: run.turnStartId === null ? -1 : branch.findIndex((entry) => entry.id === run.turnStartId);
+	const turn = branch.slice(start + 1);
+	const message = turn.findLast(isAssistantEntry)?.message;
+	// An unknown boundary, failed/aborted response or tool-use tail must not hide information.
+	if ((run.turnStartId !== null && start < 0) || (message?.stopReason && message.stopReason !== "stop")) return { message };
+
+	const calls = new Set<string>();
+	const sentIds = new Set<string>();
+	for (const entry of turn) {
+		const msg = record(entry.message);
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const part of msg.content) {
+				const call = record(part);
+				const args = record(call.arguments);
+				if (call.type === "toolCall" && call.name === "intercom" && (args.action === "send" || args.action === "reply") && typeof call.id === "string") calls.add(call.id);
+			}
+		}
+		const details = record(msg.details);
+		if (msg.role === "toolResult" && calls.has(String(msg.toolCallId)) && !msg.isError && details.delivered === true && typeof details.messageId === "string") sentIds.add(details.messageId);
+		// Nested calls (e.g. codemode) have no standalone toolResult in the transcript.
+		const data = record(entry.data);
+		if (entry.type === "custom" && entry.customType === "subagent_intercom_report" && typeof data.messageId === "string") sentIds.add(data.messageId);
+	}
+	const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
+	const final = normalize(message ? assistantText(message, "") : "");
+	let parentAlias = parentName;
+	for (const entry of turn.toReversed()) {
+		if (entry.type !== "custom" || entry.customType !== "intercom_sent") continue;
+		const data = record(entry.data);
+		if (!sentIds.has(String(data.messageId)) || typeof data.to !== "string" || !run.parentSessionId) continue;
+		const byId = data.to.length >= 8 && run.parentSessionId.startsWith(data.to);
+		if (!byId && parentAlias === undefined && run.parentSessionFile) {
+			parentAlias = readBranch(run.parentSessionFile).findLast((item) => item.type === "session_info")?.name ?? "";
+		}
+		if (!byId && (!parentAlias || data.to !== parentAlias)) continue;
+		const text = record(data.message).text;
+		if (typeof text !== "string" || typeof data.timestamp !== "number") continue;
+		const sent = normalize(text);
+		const date = new Date(data.timestamp);
+		if (!sent || !Number.isFinite(date.getTime())) continue;
+		// Mechanical only: empty, contained, or <=80 chars AND <=20% of the sent text.
+		if (!final || sent.includes(final) || (final.length <= 80 && final.length <= sent.length / 5)) {
+			return { message, reportedOverIntercomAt: date.toISOString() };
+		}
+	}
+	return { message };
+}
+
+export function assistantText(message: AssistantMessage, empty = "(no response text)"): string {
+	if (!Array.isArray(message.content)) return message.errorMessage ?? empty;
 	const parts: string[] = [];
 	for (const item of message.content) {
 		if (typeof item !== "object" || item === null) continue;
 		const block = item as Record<string, unknown>;
 		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
 	}
-	return parts.join("\n").trim() || message.errorMessage || "(no response text)";
+	return parts.join("\n").trim() || message.errorMessage || empty;
 }

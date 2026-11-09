@@ -9,7 +9,7 @@ import {
 	launchRun,
 	listRuns,
 	liveRunChecker,
-	readLatestAssistant,
+	readTurnResult,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
@@ -127,12 +127,13 @@ export async function openPicker(ctx: ExtensionContext): Promise<void> {
 }
 
 /** The message a parent receives when one child finishes, fails, or exits. */
-export function finishedReport(run: RunMetadata, state: RunState, activeMs: number): string {
+export function finishedReport(run: RunMetadata, state: RunState, activeMs: number, parentName?: string): string {
 	const head = `Subagent ${runDisplayName(run)}`;
 	const took = formatDuration(activeMs);
 	if (state === "error") return `${head} failed after ${took}: ${run.error ?? "unknown error"}\n${runLocation(run)}`;
 	if (state === "exited") return `${head} exited before finishing.`;
-	const message = readLatestAssistant(run.sessionFile);
+	const { message, reportedOverIntercomAt } = readTurnResult(run, parentName);
+	if (reportedOverIntercomAt) return `${run.name ?? run.handle} finished (reported over intercom at ${reportedOverIntercomAt})`;
 	let reply = message ? assistantText(message) : "(no reply)";
 	if (reply.length > REPORT_CHARS) {
 		reply = `${reply.slice(0, REPORT_CHARS)}…\n(truncated; \`subagent wait ${run.handle}\` prints the whole reply)`;
@@ -155,22 +156,22 @@ export function registerParent(pi: ExtensionAPI): void {
 	let stopKeys: (() => void) | undefined;
 	const tracker = new ActivityTracker();
 	/** Last state seen per child, and since when, to notice a child that finished. */
-	const seen = new Map<string, { state: RunState; since: number }>();
-	const pending = new Map<string, { runDir: string; state: RunState; activeMs: number }>();
+	const seen = new Map<string, { state: RunState; since: number; stateSince?: string }>();
+	const pending = new Map<string, { runDir: string; state: RunState; stateSince?: string; activeMs: number }>();
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const flushReports = (): void => {
 		flushTimer = undefined;
 		const reports: string[] = [];
-		for (const [handle, { runDir, state, activeMs }] of pending) {
+		for (const [handle, { runDir, state, stateSince, activeMs }] of pending) {
 			pending.delete(handle);
 			const run = readMetadata(runDir);
 			if (!run) continue; // stopped meanwhile
 			const now = effectiveRunState(run);
-			if (isActive(now)) continue; // prompted again meanwhile
+			if (isActive(now) || now !== state || run.stateSince !== stateSince) continue; // prompted again meanwhile
 			// `subagent wait` already handed this result to the parent.
 			if (run.reportedAt && run.stateSince && run.reportedAt >= run.stateSince) continue;
-			reports.push(finishedReport(run, now === state ? state : now, activeMs));
+			reports.push(finishedReport(run, state, activeMs, pi.getSessionName()));
 			updateMetadata(runDir, { reportedAt: new Date().toISOString() });
 		}
 		if (reports.length === 0) return;
@@ -181,7 +182,7 @@ export function registerParent(pi: ExtensionAPI): void {
 	};
 
 	const queueReport = (run: RunMetadata, state: RunState, activeMs: number): void => {
-		pending.set(run.handle, { runDir: run.runDir, state, activeMs });
+		pending.set(run.handle, { runDir: run.runDir, state, stateSince: run.stateSince, activeMs });
 		flushTimer ??= setTimeout(flushReports, REPORT_DELAY_MS);
 	};
 
@@ -226,10 +227,13 @@ export function registerParent(pi: ExtensionAPI): void {
 		const runs = listRuns(ctx.sessionManager.getSessionId()).map((run) => ({ run, state: effectiveRunState(run, isLive) }));
 		for (const { run, state } of runs) {
 			const previous = seen.get(run.handle);
-			seen.set(run.handle, previous?.state === state ? previous : { state, since: now });
+			seen.set(run.handle, previous?.state === state && previous.stateSince === run.stateSince
+				? previous : { state, since: now, stateSince: run.stateSince });
 			const finished = (state === "idle" && run.hasStarted) || state === "error" || state === "exited";
 			if (!finished) continue;
-			if (previous && isActive(previous.state)) queueReport(run, state, now - previous.since);
+			if (previous && (isActive(previous.state) || previous.state !== state || previous.stateSince !== run.stateSince)) {
+				queueReport(run, state, now - previous.since);
+			}
 			// A child spawned after this session started that finished between two reads.
 			else if (!previous && Date.parse(run.createdAt) >= startedAt) queueReport(run, state, now - Date.parse(run.createdAt));
 		}

@@ -72,6 +72,18 @@ Use `/subagent`, or Left on an empty prompt, to select and attach to an active c
 
 When a child finishes, fails, or exits, the parent receives a `subagent-result` message with the reply and starts a turn if it is idle, so a parent does not need to block on `wait`. Children that finish together arrive in one message; a result that `wait` already printed is not sent again.
 
+A child is finished only after `agent_settled`, with Pi idle, no queued steering or follow-up messages, and an empty subagent inbox. The check runs after settled handlers return, because another handler can request more work. The parent checks again before delivery. A turn end is not an exit: exit notices require a dead child PID, or a missing/dead tmux pane for older children without a PID.
+
+Completion reports (including `wait`) avoid repeating a successful intercom `send` or `reply` to the parent in the same logical turn. The check reads the active transcript branch from the turn's starting leaf. Parent targets match the full session ID, a prefix of at least 8 characters, or the parent's session name. Failed sends, asks, other recipients, earlier turns, and failed/aborted final responses do not qualify. Nested intercom calls through codemode are recorded too.
+
+The text rule is mechanical and case-sensitive. Collapse whitespace in both texts, then shorten the report if the final text is empty, is contained in one qualifying intercom message, or is **at most 80 characters and at most 20%** of that message's length. Otherwise keep the full report. A shortened report is one line, with the send time in UTC:
+
+```text
+review finished (reported over intercom at 2026-11-09T22:00:00.000Z)
+```
+
+Existing parents must `/reload` their extensions to pick up completion-report changes. Reload existing children too to get the new queue checks, PID tracking, turn boundaries, and nested-call tracking; newly spawned children use them automatically.
+
 ## Isolation
 
 Optional spawn flags:

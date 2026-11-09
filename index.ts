@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { openPicker, registerParent } from "./parent.ts";
-import { inboxDir, type InboxMessage, readMetadata, updateMetadata } from "./shared.ts";
+import { hasInboxMessages, inboxDir, type InboxMessage, readMetadata, updateMetadata } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +33,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let processing = false;
 	let sessionName: string | undefined;
+	let turnActive = false;
+	let settled = false;
+	let settleTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const publishIdle = (): void => {
+		const ctx = currentContext;
+		if (!settled || !ctx || processing || !ctx.isIdle() || ctx.hasPendingMessages() || hasInboxMessages(runDir)) return;
+		turnActive = false;
+		settled = false;
+		updateMetadata(runDir, { state: "idle" });
+	};
 
 	const syncSessionName = (): void => {
 		const metadata = readMetadata(runDir);
@@ -97,31 +108,60 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (!metadata) return;
 		updateMetadata(runDir, {
 			childSessionId: ctx.sessionManager.getSessionId(),
+			pid: process.pid,
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
-			state: ctx.isIdle() ? "idle" : "busy",
+			state: ctx.isIdle() && !ctx.hasPendingMessages() && !hasInboxMessages(runDir) ? "idle" : "busy",
 			suspended: undefined,
 			error: undefined,
 		});
 		syncSessionName();
 		if (!timer) {
-			timer = setInterval(() => void processInbox(), 250);
+			timer = setInterval(() => {
+				void processInbox();
+				publishIdle();
+			}, 250);
 			timer.unref();
 		}
 		void processInbox();
 	});
 
+	pi.on("before_agent_start", (_event, ctx) => {
+		currentContext = ctx;
+		settled = false;
+		if (!turnActive) {
+			updateMetadata(runDir, { turnStartId: ctx.sessionManager.getLeafId() });
+			turnActive = true;
+		}
+		updateMetadata(runDir, { state: "busy", hasStarted: true, error: undefined });
+	});
+
 	pi.on("agent_start", (_event, ctx) => {
 		currentContext = ctx;
+		settled = false;
 		updateMetadata(runDir, { state: "busy", hasStarted: true, error: undefined });
+	});
+
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "intercom" || event.isError) return;
+		if (event.input.action !== "send" && event.input.action !== "reply") return;
+		const details = event.details as { delivered?: boolean; messageId?: string } | undefined;
+		if (details?.delivered === true && typeof details.messageId === "string") {
+			// Includes nested calls through codemode, whose tool results are not session entries.
+			pi.appendEntry("subagent_intercom_report", { messageId: details.messageId });
+		}
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		currentContext = ctx;
-		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle" });
+		settled = true;
+		// Other settled handlers can request more work. Check after all handlers return.
+		if (settleTimer) clearTimeout(settleTimer);
+		settleTimer = setTimeout(publishIdle, 0);
 	});
 
 	pi.on("session_shutdown", (event) => {
 		currentContext = undefined;
+		if (settleTimer) clearTimeout(settleTimer);
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;

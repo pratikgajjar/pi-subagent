@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -11,7 +11,7 @@ import {
 	inboxDir,
 	launchRun,
 	listRuns,
-	readLatestAssistant,
+	readTurnResult,
 	readMetadata,
 	removeRunDir,
 	renameRunWindow,
@@ -271,19 +271,18 @@ async function waitSubagent(args: string[]): Promise<void> {
 
 	while (Date.now() < deadline) {
 		const metadata = getRun(handle);
-		const pending = existsSync(inboxDir(metadata.runDir))
-			? readdirSync(inboxDir(metadata.runDir)).some((file) => file.endsWith(".json"))
-			: false;
 		const state = effectiveRunState(metadata);
 		if (state === "error") fail(metadata.error || `${handle} failed`);
 		if (state === "exited") fail(`${handle} exited before finishing`);
-		if (metadata.hasStarted && state === "idle" && !pending) {
-			const message = readLatestAssistant(metadata.sessionFile);
-			if (!message) fail(`${handle} finished without an assistant response`);
-			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
+		if (metadata.hasStarted && state === "idle") {
+			const { message, reportedOverIntercomAt } = readTurnResult(metadata);
+			if (!message && !reportedOverIntercomAt) fail(`${handle} finished without an assistant response`);
+			process.stdout.write(reportedOverIntercomAt
+				? `${metadata.name ?? handle} finished (reported over intercom at ${reportedOverIntercomAt})\n`
+				: `${handle} finished\n\n${assistantText(message!)}\n`);
 			// The parent extension skips its completion message for a result printed here.
 			updateMetadata(metadata.runDir, { reportedAt: new Date().toISOString() });
-			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
+			if (message?.stopReason === "error" || message?.stopReason === "aborted") process.exitCode = 1;
 			return;
 		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
