@@ -222,12 +222,17 @@ function tmuxOutput(args: string[]): string | undefined {
 	return result.status === 0 ? result.stdout.trim() : undefined;
 }
 
-/** The tmux session of the calling pane, when the caller runs inside tmux. */
+/**
+ * The tmux session that hosts a child's window: the calling pane's session when the caller runs inside tmux,
+ * else PI_SUBAGENT_TMUX_SESSION, else the session tmux treats as current (the most recently used client's).
+ * Callers outside tmux (daemons, relays) then still put children beside the user's windows, not in loose sessions.
+ */
 function hostSession(): { id: string; name: string } | undefined {
-	const pane = process.env.TMUX_PANE;
-	if (!process.env.TMUX || !pane) return undefined;
-	const [id, name] = (tmuxOutput(["display-message", "-p", "-t", pane, "#{session_id}\t#{session_name}"]) ?? "").split("\t");
-	return id && name ? { id, name } : undefined;
+	const pane = process.env.TMUX ? process.env.TMUX_PANE : undefined;
+	const named = process.env.PI_SUBAGENT_TMUX_SESSION;
+	const target = pane ? ["-t", pane] : named ? ["-t", `=${named}:`] : [];
+	const [id, name] = (tmuxOutput(["display-message", "-p", ...target, "#{session_id}\t#{session_name}"]) ?? "").split("\t");
+	return id && name && !name.startsWith("pi-subagent-") ? { id, name } : undefined;
 }
 
 /** The child's name as a tmux window name: `:` and `.` separate tmux targets, so they become `-`. */
